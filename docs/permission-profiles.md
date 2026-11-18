@@ -8,7 +8,7 @@ python3 scripts/generate_permission_profile.py --name isolated --validate
 python3 scripts/generate_permission_profile.py --name isolated --output isolated.toml
 ```
 
-The default command prints TOML to stdout. Diagnostics go to stderr. `--output` creates a new file exclusively. `--validate` checks the policy against the current HOME, mount table, and known Linux `:minimal` paths without writing a file. Effective permissions also depend on Codex and its launch environment.
+The default command prints TOML to stdout with a top-level `default_permissions = "generated"` setting. Use `--name` to change both the generated profile name and the value of `default_permissions`. Diagnostics go to stderr. `--output` creates a new file exclusively. `--validate` checks the policy against the current HOME, mount table, and known Linux `:minimal` paths without writing a file. Effective permissions also depend on Codex and its launch environment.
 
 ## Activate and revert
 
@@ -20,7 +20,7 @@ The default command prints TOML to stdout. Diagnostics go to stderr. `--output` 
    codex -c 'default_permissions="isolated"' -C /path/to/workspace
    ```
 
-   For persistent selection, set `default_permissions = "isolated"` at the top level of your user config. Review existing legacy `sandbox_mode` and `sandbox_workspace_write` settings before selecting a named profile. Avoid passing `--sandbox` at launch because legacy sandbox settings can change which policy is selected. The CLI `--profile` flag selects a configuration layer. [Codex configuration reference](https://developers.openai.com/codex/config-reference)
+   For persistent selection, copy the generated `default_permissions` line into your user config before the first table, or replace the existing top-level setting. Review existing legacy `sandbox_mode` and `sandbox_workspace_write` settings before selecting a named profile. Avoid passing `--sandbox` at launch because legacy sandbox settings can change which policy is selected. The CLI `--profile` flag selects a configuration layer. [Codex configuration reference](https://developers.openai.com/codex/config-reference)
 
 To revert a one-off selection, exit the session and omit the command-line override. To revert a persistent selection, restore the previous `default_permissions` setting and remove the generated tables. You can also restore your backup if you made no other config edits. Restore the wrapper launcher if you previously used it, and restart Codex.
 

@@ -139,6 +139,7 @@ class ProfileTests(unittest.TestCase):
         self.make_directory(unusual)
         self.make_directory("glob[abc]")
         parsed = tomllib.loads(generate(self.host(), name).toml())
+        self.assertEqual(parsed["default_permissions"], name)
         profile = parsed["permissions"][name]
         self.assertEqual(set(profile), {"filesystem"})
         fs = profile["filesystem"]
@@ -246,23 +247,32 @@ class ProfileTests(unittest.TestCase):
     def test_cli_validate_stdout_and_no_clobber_output(self):
         output = self.root / "profile.toml"
         env = dict(os.environ, HOME=str(self.root / "home/alice"))
-        command = [sys.executable, str(SCRIPT), "--temp", "none", "--name", "cli-test"]
+        command = [sys.executable, str(SCRIPT), "--temp", "none"]
 
         def run(*args):
             return subprocess.run([*command, *args], env=env, capture_output=True,
                                   text=True, timeout=15)
 
-        preview = run()
+        default = run()
+        self.assertEqual(default.returncode, 0, default.stderr)
+        parsed = tomllib.loads(default.stdout)
+        self.assertEqual(parsed["default_permissions"], "generated")
+        self.assertIn("generated", parsed["permissions"])
+
+        named = ("--name", "cli-test")
+        preview = run(*named)
         self.assertEqual(preview.returncode, 0, preview.stderr)
-        self.assertIn("cli-test", tomllib.loads(preview.stdout)["permissions"])
-        checked = run("--validate")
+        parsed = tomllib.loads(preview.stdout)
+        self.assertEqual(parsed["default_permissions"], "cli-test")
+        self.assertIn("cli-test", parsed["permissions"])
+        checked = run(*named, "--validate")
         self.assertEqual(checked.returncode, 0, checked.stderr)
         self.assertIn("Validated 'cli-test'", checked.stdout)
         self.assertFalse(output.exists())
-        written = run("--output", str(output))
+        written = run(*named, "--output", str(output))
         self.assertEqual(written.returncode, 0, written.stderr)
         self.assertEqual(output.read_text(encoding="utf-8"), preview.stdout)
-        self.assertNotEqual(run("--output", str(output)).returncode, 0)
+        self.assertNotEqual(run(*named, "--output", str(output)).returncode, 0)
         self.assertEqual(output.read_text(encoding="utf-8"), preview.stdout)
 
     def test_bubblewrap_visibility(self):

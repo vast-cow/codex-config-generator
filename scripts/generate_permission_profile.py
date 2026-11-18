@@ -88,8 +88,9 @@ class Profile:
     notices: list[str]
 
     def toml(self):
-        prefix = f"permissions.{quote(self.name)}"
-        lines = [f"[{prefix}]", f"[{prefix}.filesystem]", ""]
+        name = quote(self.name)
+        prefix = f"permissions.{name}"
+        lines = [f"default_permissions = {name}", "", f"[{prefix}]", f"[{prefix}.filesystem]", ""]
         lines.extend(f'{quote(path)} = "{access}"' for path, access in self.grants.items())
         lines.extend(("", f'[{prefix}.filesystem.":workspace_roots"]'))
         lines.extend(f'{quote(path)} = "{access}"' for path, access in WORKSPACE.items())
@@ -295,7 +296,8 @@ def generate(host, name="generated", include=(), exclude=(), temp="auto", temp_d
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--name", default="generated", help="permission profile name")
+    parser.add_argument("--name", default="generated",
+                        help="permission profile name used for default_permissions (default: %(default)s)")
     parser.add_argument("--include", action="append", default=[], metavar="DIR",
                         help="add an existing absolute directory as read-only (repeatable)")
     parser.add_argument("--exclude", action="append", default=[], metavar="PATH",
