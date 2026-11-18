@@ -22,6 +22,7 @@ RUNTIME_ROOTS = ("/dev", "/proc")
 DEFAULT_OMISSIONS = {
     "afs", "dev", "home", "media", "mnt", "proc", "root", "run", "sys", "tmp",
 }
+NON_LOGIN_SHELLS = {"nologin", "false"}
 CODEX_PATHS = (
     ("packages", "read", stat.S_ISDIR),
     ("memories", "write", stat.S_ISDIR),
@@ -108,7 +109,7 @@ def is_wsl(release, environment):
 
 
 class Host:
-    def __init__(self, root, home, mounts, wsl=False):
+    def __init__(self, root, home, mounts, wsl=False, report=lambda _: None):
         self.root = root  # The caller can supply a fixture root for tests.
         self.mounts = mounts
         self.wsl = wsl
@@ -118,11 +119,21 @@ class Host:
         self.logical_home = Path("/" + os.path.normpath(home).lstrip("/"))
         if self.home == ROOT or self.logical_home == ROOT or not self.real(self.home).is_dir():
             raise ValueError("HOME must be an existing directory beneath /")
-        self.home_backings = {
-            (mount.device, backing)
-            for mount in mounts
-            if (backing := self.backing_slice(mount, self.home)) is not None
+        report(f"Current HOME: {str(self.logical_home)!r} (canonical: {str(self.home)!r})")
+        discovered = set(self.discover_homes(report))
+        self.home_paths = {self.home, self.logical_home}
+        for logical, canonical in discovered:
+            self.home_paths.update((logical, canonical))
+        self.home_roots = {ROOT / home.parts[1] for home in self.home_paths}
+        report("Excluded top-level home directories: " +
+               ", ".join(repr(str(path)) for path in sorted(self.home_roots)))
+        self.home_backings = self.backing_paths(self.home_paths)
+        # Accounts that share the current HOME also share its Codex exceptions.
+        self.other_home_paths = {
+            path for logical, canonical in discovered if canonical != self.home
+            for path in (logical, canonical)
         }
+        self.other_home_backings = self.backing_paths(self.other_home_paths)
         # A separate mount may be an innocuous rebinding of the same directory
         # at the same path (for example a container making /tmp writable).
         self.other_mounts = [
@@ -138,8 +149,54 @@ class Host:
     def real(self, path):
         return self.root.joinpath(*path.parts[1:])
 
-    def canonical(self, path):
-        return ROOT / self.real(path).resolve(strict=True).relative_to(self.root)
+    def canonical(self, path, *, strict=True):
+        return ROOT / self.real(path).resolve(strict=strict).relative_to(self.root)
+
+    def discover_homes(self, report):
+        import pwd
+
+        try:
+            users = pwd.getpwall()
+        except (OSError, RuntimeError) as error:
+            raise ValueError(f"cannot enumerate users through NSS: {error}. "
+                             "Check the system passwd database and NSS configuration") from error
+        if not users:
+            report("warning: NSS returned no users; verify passwd enumeration with getent passwd")
+        for user in sorted(users, key=lambda entry: (entry.pw_name, entry.pw_dir, entry.pw_shell)):
+            shell = Path(user.pw_shell).name
+            if shell in NON_LOGIN_SHELLS:
+                report(f"Skipping {user.pw_name!r}: non-login shell {shell!r}")
+                continue
+            label = f"Login-capable user {user.pw_name!r}, home {user.pw_dir!r}"
+            path = Path(user.pw_dir)
+            if not path.is_absolute() or "\x00" in user.pw_dir:
+                report(f"warning: {label}: expected an absolute home directory; ignoring entry")
+                continue
+            # Linux treats a leading double slash like a single slash.
+            logical = Path("/" + os.path.normpath(path).lstrip("/"))
+            try:
+                try:
+                    canonical = self.canonical(path)
+                    mode = self.real(path).stat().st_mode
+                except FileNotFoundError:
+                    canonical = self.canonical(path, strict=False)
+                    mode = None
+            except NotADirectoryError:
+                report(f"warning: {label}: expected a directory; ignoring entry")
+                continue
+            except (OSError, RuntimeError, ValueError) as error:
+                raise ValueError(f"{label}: cannot resolve home; check the passwd entry "
+                                 f"and its symlinks ({error})") from error
+            if mode is not None and not stat.S_ISDIR(mode):
+                report(f"warning: {label}: expected a directory; ignoring entry")
+                continue
+            if ROOT in (logical, canonical):
+                raise ValueError(f"{label} resolves to /; configure a dedicated home directory "
+                                 "for this account before generating a profile")
+            if mode is None:
+                report(f"warning: {label} does not exist; protecting its configured path")
+            report(f"{label} (canonical: {str(canonical)!r})")
+            yield logical, canonical
 
     @staticmethod
     def backing_slice(mount, path):
@@ -149,25 +206,30 @@ class Host:
             return mount.source
         return None
 
-    def home_conflict(self, path):
-        if any(overlap(path, home) for home in (self.home, self.logical_home)):
-            return True
+    def backing_paths(self, paths):
+        return {(mount.device, backing) for mount in self.mounts for path in paths
+                if (backing := self.backing_slice(mount, path)) is not None}
+
+    def home_conflict(self, path, *, other_users=False):
+        paths = self.other_home_paths if other_users else self.home_paths
+        if any(overlap(path, home) for home in paths):
+            return "overlaps HOME or another login home"
+        backings = self.other_home_backings if other_users else self.home_backings
         # Include covering and nested mounts on both sides. Keep shadowed
         # backing paths too, since another bind can expose those paths.
-        for mount in self.mounts:
-            backing = self.backing_slice(mount, path)
-            if backing is not None and any(
-                mount.device == device and overlap(backing, private)
-                for device, private in self.home_backings
-            ):
-                return True
-        return False
+        for device, backing in self.backing_paths((path,)):
+            if any(device == home_device and overlap(backing, private)
+                   for home_device, private in backings):
+                return "overlaps a mounted alias of HOME or another login home"
+        return None
 
     def read_conflict(self, path, excludes, *, temporary=False):
-        if self.home_conflict(path):
-            return "overlaps HOME or a mounted alias of HOME"
-        if any(overlap(path, excluded) for excluded in excludes):
-            return "overlaps an excluded path"
+        reason = self.home_conflict(path)
+        if reason:
+            return reason
+        excluded = min((excluded for excluded in excludes if overlap(path, excluded)), default=None)
+        if excluded is not None:
+            return f"overlaps an excluded path {str(excluded)!r}"
         if self.wsl and overlap(path, Path("/mnt")):
             return "overlaps the WSL mount tree /mnt"
         for mount in self.other_mounts:
@@ -198,10 +260,13 @@ class Host:
     def validate_minimal(self, excludes):
         for value in RUNTIME_ROOTS:
             path = Path(value)
-            if self.home_conflict(path):
-                raise ValueError(f"HOME overlaps the Linux runtime path {value}")
+            reason = self.home_conflict(path)
+            if reason:
+                raise ValueError(f"Linux runtime path {value} {reason}. "
+                                 "Review the overlapping account home or mount")
             if any(overlap(path, excluded) for excluded in excludes):
-                raise ValueError(f"cannot exclude the Linux runtime path {value}")
+                raise ValueError(f"cannot exclude the Linux runtime path {value}. "
+                                 "Review the overlapping exclusion or account home")
         for value in MINIMAL_ROOTS:
             path = Path(value)
             try:
@@ -211,7 +276,9 @@ class Host:
             for candidate in (path, canonical):
                 reason = self.read_conflict(candidate, excludes)
                 if reason:
-                    raise ValueError(f":minimal implicitly grants {value}: {reason}")
+                    raise ValueError(f":minimal implicitly grants {value}: {reason}. "
+                                     "Review the overlapping path, account home, or mount "
+                                     "before generating a profile")
 
     def codex_grants(self, excludes, notices):
         codex = self.home / ".codex"
@@ -239,6 +306,10 @@ class Host:
             if not expected_type(mode) or foreign_mount or not literal_path(path):
                 notices.append(f"skipping unsafe optional Codex path {str(path)!r}")
                 continue
+            reason = self.home_conflict(path, other_users=True)
+            if reason:
+                notices.append(f"skipping optional Codex path {str(path)!r}: {reason}")
+                continue
             yield str(path), access
 
 
@@ -249,22 +320,21 @@ def generate(host, name="generated", include=(), exclude=(), temp="auto", temp_d
     excludes = {directory_path(value) for value in exclude}
     excludes.update(host.canonical(path) for path in tuple(excludes)
                     if host.real(path).exists())
-    host.validate_minimal(excludes)
+    read_excludes = excludes | host.home_roots
+    host.validate_minimal(read_excludes)
 
-    # Exclude both branches if HOME was reached via a symlink.
-    omitted = DEFAULT_OMISSIONS | {host.home.parts[1], host.logical_home.parts[1]}
     directories = set()
     for child in host.root.iterdir():
         path = ROOT / child.name
         # Check the mount table before touching a potentially automounted
         # child. lstat identifies directories without resolving symlinks.
-        if (child.name not in omitted and literal_path(path)
-                and not host.read_conflict(path, excludes)
+        if (child.name not in DEFAULT_OMISSIONS and literal_path(path)
+                and not host.read_conflict(path, read_excludes)
                 and stat.S_ISDIR(child.lstat().st_mode)):
             directories.add(path)
     for value in include:
         path = directory_path(value)
-        reason = host.directory_conflict(path, excludes)
+        reason = host.directory_conflict(path, read_excludes)
         if reason:
             raise ValueError(f"cannot include {value!r}: {reason}")
         directories.add(path)
@@ -318,7 +388,8 @@ def main(argv=None):
         mountinfo = Path("/proc/self/mountinfo")
         snapshot = mountinfo.read_bytes()
         mounts = parse_mountinfo(snapshot.decode("utf-8", errors="surrogateescape"))
-        host = Host(ROOT, Path.home(), mounts, is_wsl(os.uname().release, os.environ))
+        host = Host(ROOT, Path.home(), mounts, is_wsl(os.uname().release, os.environ),
+                    report=lambda message: print(message, file=sys.stderr))
         profile = generate(host, args.name, args.include, args.exclude, args.temp, args.temp_dir)
         if mountinfo.read_bytes() != snapshot:
             raise ValueError("mount table changed during discovery, rerun the generator")

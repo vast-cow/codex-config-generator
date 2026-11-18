@@ -8,7 +8,15 @@ python3 scripts/generate_permission_profile.py --name isolated --validate
 python3 scripts/generate_permission_profile.py --name isolated --output isolated.toml
 ```
 
-The default command prints TOML to stdout. Diagnostics go to stderr. `--output` creates a new file exclusively. `--validate` checks the policy against the current HOME, mount table, and known Linux `:minimal` paths without writing a file. Effective permissions also depend on Codex and its launch environment.
+The default command prints TOML to stdout. Diagnostics go to stderr and show discovered login-capable accounts and their home paths, skipped non-login accounts, the sorted list of excluded top-level directories, and any warnings. `--output` creates a new file exclusively. `--validate` checks the policy against the discovered homes, mount table, and known Linux `:minimal` paths without writing a file. Effective permissions also depend on Codex and its launch environment.
+
+## Which homes are protected
+
+Python's `pwd.getpwall()` enumerates the system passwd database through the configured Name Service Switch (NSS) sources. The generator skips shells whose final path component is `nologin` or `false`, including `/usr/sbin/nologin`, `/sbin/nologin`, `/bin/false`, and `/usr/bin/false`. Every other shell value is treated as potentially login-capable, including an empty value, custom shells, and special-purpose commands. This classification uses only the shell field. The current `HOME` is always protected, including when its account is missing from the results or has a skipped shell.
+
+Each usable home contributes the first directory below `/` from both its normalized configured path and its symlink-resolved path. For example, `/home/alice` and `/home/bob` contribute `/home`, `/root` contributes `/root`, and `/srv/users/dev` contributes `/srv`. Valid absolute homes that are missing on disk still contribute exclusions, including any resolvable symlink target. Empty or relative paths, paths containing a NUL byte, and paths that refer to a non-directory are skipped with warnings. A home that resolves to `/` or cannot be safely resolved stops generation.
+
+Some NSS backends can look up individual accounts while returning only a subset of accounts during enumeration. A reported lookup error stops generation. An empty result emits a warning and still protects the current HOME. Verify coverage with your account provider and use `--exclude` for any additional home paths or branches.
 
 ## Activate and revert
 
@@ -48,20 +56,20 @@ Check that the marker exists outside the sandbox before running the probe and re
 
 ## Filesystem rules
 
-- The generator discovers real directories directly below `/` and excludes the branches containing logical and canonical HOME. It skips top-level symlinks, `/home`, `/root`, `/afs`, `/mnt`, `/media`, and broad grants to `/proc`, `/sys`, `/dev`, and `/run`. Linux Bubblewrap supplies a minimal `/dev` and manages `/proc` itself.
-- Linux mountinfo provides the backing device and filesystem-relative path for bind mounts. The generator compares overlapping source paths, including mounts inside HOME, and skips grants with separate mounts at, below, or above the granted path. Rebinds of the same backing directory at the same path are eligible. On WSL the generator excludes the `/mnt` tree even with overrides. Separate Windows drive mounts elsewhere are also excluded, including mounts reported as 9p or drvfs.
-- `:minimal` covers `/bin`, `/sbin`, `/usr`, `/etc`, `/lib`, `/lib64`, `/nix/store`, and `/run/current-system/sw` when present. The generator aborts if an implicit read root overlaps HOME, aliases HOME, or would bypass an exclusion or mount check. So a separately mounted system tree or a HOME inside a runtime directory can prevent generation. [Codex Linux mount implementation](https://github.com/openai/codex/blob/main/codex-rs/linux-sandbox/src/bwrap.rs)
-- The generator uses absolute paths below canonical HOME for the three exceptions. Existing `.codex/packages` and `.codex/AGENTS.md` receive read access and `.codex/memories` receives write access. Missing paths are skipped. The generator rejects a symlinked `.codex` directory and skips unsafe optional entries. It accepts an exact regular-file mount for `AGENTS.md`, which can be an intentional bind of a shared instructions file.
+- The generator discovers real directories directly below `/` and excludes the branches containing the configured or canonical paths of protected homes. It skips top-level symlinks, `/home`, `/root`, `/afs`, `/mnt`, `/media`, and broad grants to `/proc`, `/sys`, `/dev`, and `/run`. Linux Bubblewrap supplies a minimal `/dev` and manages `/proc` itself.
+- Linux mountinfo provides the backing device and filesystem-relative path for bind mounts. The generator compares overlapping source paths, including mounts inside protected homes, and skips grants with separate mounts at, below, or above the granted path. Rebinds of the same backing directory at the same path are eligible when they pass the home checks. On WSL the generator excludes the `/mnt` tree even with overrides. Separate Windows drive mounts elsewhere are also excluded, including mounts reported as 9p or drvfs.
+- `:minimal` covers `/bin`, `/sbin`, `/usr`, `/etc`, `/lib`, `/lib64`, `/nix/store`, and `/run/current-system/sw` when present. Generation stops if these grants or Linux runtime paths would bypass a home exclusion or mount check. Review the account home and mounts named in the diagnostics before retrying. [Codex Linux mount implementation](https://github.com/openai/codex/blob/main/codex-rs/linux-sandbox/src/bwrap.rs)
+- The generator uses absolute paths below canonical HOME for the three exceptions. Existing `.codex/packages` and `.codex/AGENTS.md` receive read access and `.codex/memories` receives write access. Missing paths are skipped. The generator rejects a symlinked `.codex` directory and skips unsafe optional entries, including paths that expose a different account home through a mount alias. Accounts with the same canonical HOME share these exceptions. An exact regular-file mount for `AGENTS.md` is eligible, which lets you bind a shared instructions file.
 - `:workspace_roots` grants write access to each workspace and explicitly grants write access to its `.git`, `.agents`, `.codex`, and `.aws` entries. Workspace grants are resolved by Codex at launch, so select roots that do not contain HOME or unrelated user data. Review workspace mounts, symlinks, Git worktree metadata, and additional roots before using the profile.
 
-Use `--include DIR` for an existing absolute directory that would otherwise be omitted and `--exclude PATH` to omit overlapping grants. Both flags are repeatable. Excluding a descendant removes the whole overlapping directory grant. You can then include narrower sibling directories explicitly. Explicit includes still pass the HOME, symlink, and mount checks.
+Use `--include DIR` for an existing absolute directory that would otherwise be omitted and `--exclude PATH` to omit overlapping grants. Both flags are repeatable. Excluding a descendant removes the whole overlapping directory grant. You can then include narrower sibling directories explicitly if they pass the home branch, symlink, and mount checks.
 
 ```sh
 python3 scripts/generate_permission_profile.py \
   --exclude /var/lib/private --include /var/log --temp none
 ```
 
-Temporary access defaults to `--temp auto`. It grants `:slash_tmp` write access when `/tmp` passes the checks, including a standalone `/tmp` tmpfs. If `/tmp` is unsafe, the generator emits a diagnostic and omits the grant. Use `--temp slash-tmp` to require that grant, or `--temp none` to omit it. To use a narrower directory, create an existing private directory, pass it to `--temp-dir`, and set `TMPDIR` for the sandboxed commands that use it. The profile binds this exact path even if a later process changes its `TMPDIR`.
+Temporary access defaults to `--temp auto`. It grants `:slash_tmp` write access when `/tmp` passes the checks, including a standalone `/tmp` tmpfs. If `/tmp` is unsafe, the generator emits a diagnostic and omits the grant. Use `--temp slash-tmp` to require that grant, or `--temp none` to omit it. To use a narrower directory, create an existing private directory that does not overlap a protected home or its mount aliases, pass it to `--temp-dir`, and set `TMPDIR` for the sandboxed commands that use it. The profile binds this exact path even if a later process changes its `TMPDIR`.
 
 ```sh
 scratch=$(mktemp -d /tmp/codex-work.XXXXXXXX)
