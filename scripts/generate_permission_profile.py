@@ -22,7 +22,7 @@ RUNTIME_ROOTS = ("/dev", "/proc")
 DEFAULT_OMISSIONS = {
     "afs", "dev", "home", "media", "mnt", "proc", "root", "run", "sys", "tmp",
 }
-NON_LOGIN_SHELLS = {"nologin", "false"}
+NON_LOGIN_SHELLS = {"nologin", "false", "halt", "shutdown", "sync"}
 CODEX_PATHS = (
     ("packages", "read", stat.S_ISDIR),
     ("memories", "write", stat.S_ISDIR),
@@ -108,8 +108,23 @@ def is_wsl(release, environment):
     )
 
 
+def parse_shells(text, report):
+    shells = set()
+    for number, line in enumerate(text.split("\n"), start=1):
+        shell = line.partition("#")[0].strip()
+        if not shell:
+            continue
+        path = Path(shell)
+        if not path.is_absolute() or not path.name or "\x00" in shell:
+            report(f"warning: invalid /etc/shells entry on line {number}: {shell!r}")
+            continue
+        shells.add(shell)
+    return shells
+
+
 class Host:
-    def __init__(self, root, home, mounts, wsl=False, report=lambda _: None):
+    def __init__(self, root, home, mounts, wsl=False, report=lambda _: None, *,
+                 unknown_shell="protect"):
         self.root = root  # The caller can supply a fixture root for tests.
         self.mounts = mounts
         self.wsl = wsl
@@ -120,7 +135,7 @@ class Host:
         if self.home == ROOT or self.logical_home == ROOT or not self.real(self.home).is_dir():
             raise ValueError("HOME must be an existing directory beneath /")
         report(f"Current HOME: {str(self.logical_home)!r} (canonical: {str(self.home)!r})")
-        discovered = set(self.discover_homes(report))
+        discovered = set(self.discover_homes(report, unknown_shell))
         self.home_paths = {self.home, self.logical_home}
         for logical, canonical in discovered:
             self.home_paths.update((logical, canonical))
@@ -152,9 +167,11 @@ class Host:
     def canonical(self, path, *, strict=True):
         return ROOT / self.real(path).resolve(strict=strict).relative_to(self.root)
 
-    def discover_homes(self, report):
+    def discover_homes(self, report, unknown_shell):
         import pwd
 
+        if unknown_shell not in ("protect", "error"):
+            raise ValueError(f"invalid unknown shell policy: {unknown_shell!r}")
         try:
             users = pwd.getpwall()
         except (OSError, RuntimeError) as error:
@@ -162,11 +179,25 @@ class Host:
                              "Check the system passwd database and NSS configuration") from error
         if not users:
             report("warning: NSS returned no users; verify passwd enumeration with getent passwd")
+        try:
+            contents = self.real(Path("/etc/shells")).read_text(
+                encoding="utf-8", errors="surrogateescape")
+        except OSError as error:
+            report(f"warning: cannot read /etc/shells ({error}); applying the unknown shell policy")
+            shells = set()
+        else:
+            shells = parse_shells(contents, report)
         for user in sorted(users, key=lambda entry: (entry.pw_name, entry.pw_dir, entry.pw_shell)):
             shell = Path(user.pw_shell).name
             if shell in NON_LOGIN_SHELLS:
                 report(f"Skipping {user.pw_name!r}: non-login shell {shell!r}")
                 continue
+            if user.pw_shell not in shells:
+                message = (f"unknown shell {user.pw_shell!r} for {user.pw_name!r}, "
+                           f"home {user.pw_dir!r}: no matching /etc/shells entry")
+                if unknown_shell == "error":
+                    raise ValueError(message)
+                report(f"warning: {message}; treating account as potentially login-capable")
             label = f"Login-capable user {user.pw_name!r}, home {user.pw_dir!r}"
             path = Path(user.pw_dir)
             if not path.is_absolute() or "\x00" in user.pw_dir:
@@ -370,6 +401,8 @@ def main(argv=None):
                         help="add an existing absolute directory as read-only (repeatable)")
     parser.add_argument("--exclude", action="append", default=[], metavar="PATH",
                         help="omit grants overlapping an absolute path (repeatable)")
+    parser.add_argument("--unknown-shell", choices=("protect", "error"), default="protect",
+                        help="protect homes with unknown shells (default) or stop generation")
     temporary = parser.add_mutually_exclusive_group()
     temporary.add_argument("--temp", choices=("auto", "slash-tmp", "none"), default="auto",
                            help="grant safe /tmp, require /tmp, or omit temp access")
@@ -389,7 +422,8 @@ def main(argv=None):
         snapshot = mountinfo.read_bytes()
         mounts = parse_mountinfo(snapshot.decode("utf-8", errors="surrogateescape"))
         host = Host(ROOT, Path.home(), mounts, is_wsl(os.uname().release, os.environ),
-                    report=lambda message: print(message, file=sys.stderr))
+                    report=lambda message: print(message, file=sys.stderr),
+                    unknown_shell=args.unknown_shell)
         profile = generate(host, args.name, args.include, args.exclude, args.temp, args.temp_dir)
         if mountinfo.read_bytes() != snapshot:
             raise ValueError("mount table changed during discovery, rerun the generator")

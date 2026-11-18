@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from scripts.generate_permission_profile import (
-    Host, WORKSPACE, generate, is_wsl, parse_mountinfo,
+    Host, WORKSPACE, generate, is_wsl, parse_mountinfo, parse_shells,
 )
 
 
@@ -33,6 +33,8 @@ class ProfileTests(unittest.TestCase):
         for directory in ("home/alice", "root", "users/alice", "opt", "usr/bin",
                           "etc", "tmp", "var", "proc", "sys", "dev", "run"):
             self.make_directory(directory)
+        self.shells = self.root / "etc/shells"
+        self.shells.write_text("/bin/bash\n/bin/zsh\n", encoding="utf-8")
 
     def make_directory(self, path):
         directory = self.root / path.lstrip("/")
@@ -94,17 +96,87 @@ class ProfileTests(unittest.TestCase):
 
     def test_non_login_shells_are_skipped_and_current_home_stays_protected(self):
         self.make_directory("var/lib/service")
+        self.shells.write_text("/usr/sbin/nologin\n/bin/false\n", encoding="utf-8")
         self.users.return_value = [
             account("service", "/var/lib/service", shell)
             for shell in ("/usr/sbin/nologin", "/sbin/nologin", "nologin",
                           "/bin/false", "/usr/bin/false")
         ] + [account("alice", "/users/alice", "/bin/false")]
         diagnostics = []
-        host = self.host(home="/users/alice", report=diagnostics.append)
+        host = self.host(home="/users/alice", report=diagnostics.append, unknown_shell="error")
         self.assertEqual(host.home_roots, {Path("/users")})
         self.assertEqual(generate(host).grants["/var"], "read")
         self.assertNotIn("/users", generate(host).grants)
         self.assertEqual(sum("non-login shell" in line for line in diagnostics), 6)
+
+    def test_shells_parsing(self):
+        diagnostics = []
+        shells = parse_shells(
+            "  # comment\r\n\n /bin/sh  \r\n\t/bin/bash # comment\n/bin/sh\n"
+            "bin/zsh\n/\n/bin/invalid\x00shell\n/opt/custom/login",
+            diagnostics.append,
+        )
+        self.assertEqual(shells, {"/bin/sh", "/bin/bash", "/opt/custom/login"})
+        self.assertEqual(len(diagnostics), 3)
+        self.assertIn("line 6: 'bin/zsh'", diagnostics[0])
+
+    def test_system_commands_do_not_exclude_usr_or_sbin(self):
+        self.make_directory("usr/sbin")
+        (self.root / "sbin").symlink_to("usr/sbin")
+        self.shells.write_text("/sbin/halt\n/usr/sbin/shutdown\n/bin/sync\n", encoding="utf-8")
+        self.users.return_value = [
+            account("halt", "/sbin", "/sbin/halt"),
+            account("shutdown", "/sbin", "/usr/sbin/shutdown"),
+            account("sync", "/sbin", "/bin/sync"),
+        ]
+        diagnostics = []
+        host = self.host(report=diagnostics.append, unknown_shell="error")
+        self.assertEqual(host.home_roots, {Path("/home")})
+        grants = generate(host).grants
+        self.assertEqual(grants[":minimal"], "read")
+        self.assertEqual(grants["/usr"], "read")
+        for name in ("halt", "shutdown", "sync"):
+            self.assertIn(f"Skipping {name!r}: non-login shell {name!r}", diagnostics)
+
+    def test_unknown_shells_are_reported_and_protect_homes_by_default(self):
+        for shell in ("/opt/custom/bash", "bash", ""):
+            self.users.return_value = [account("unknown", "/usr/local/home", shell)]
+            diagnostics = []
+            with self.subTest(shell=shell):
+                host = self.host(report=diagnostics.append)
+                self.assertTrue(any(f"unknown shell {shell!r} for 'unknown'" in line
+                                    for line in diagnostics))
+                with self.assertRaisesRegex(ValueError, ":minimal implicitly grants /usr"):
+                    generate(host)
+                with self.assertRaisesRegex(ValueError, "unknown shell.*for 'unknown'"):
+                    self.host(unknown_shell="error")
+
+    def test_unavailable_shells_database_uses_unknown_shell_policy(self):
+        for unreadable in (False, True):
+            with self.subTest(unreadable=unreadable):
+                if unreadable:
+                    self.shells.mkdir()  # A non-file entry makes the read fail.
+                else:
+                    self.shells.unlink()
+                self.users.return_value = [account("dev", "/srv/dev")]
+                diagnostics = []
+                host = self.host(report=diagnostics.append)
+                self.assertIn(Path("/srv"), host.home_roots)
+                self.assertTrue(any("cannot read /etc/shells" in line for line in diagnostics))
+                self.assertTrue(any("unknown shell '/bin/bash'" in line for line in diagnostics))
+                with self.assertRaisesRegex(ValueError, "unknown shell '/bin/bash'"):
+                    self.host(unknown_shell="error")
+
+    def test_listed_custom_shell_protects_an_unusual_home(self):
+        shell = "/run/current-system/sw/bin/fish"
+        self.shells.write_text(f"{shell}\n", encoding="utf-8")
+        self.make_directory("srv/dev")
+        self.make_directory("users")
+        (self.root / "users/dev").symlink_to("../srv/dev")
+        self.users.return_value = [account("dev", "/users/dev", shell)]
+        host = self.host(unknown_shell="error")
+        self.assertEqual(host.home_roots, {Path("/home"), Path("/users"), Path("/srv")})
+        self.assertTrue({"/users", "/srv"}.isdisjoint(generate(host).grants))
 
     def test_enumeration_can_omit_current_home_or_return_no_entries(self):
         self.users.return_value = [account("root", "/root")]
@@ -423,7 +495,7 @@ import sys
 
 script, home, *args = sys.argv[1:]
 with patch("pwd.getpwall", return_value=[
-    SimpleNamespace(pw_name="fixture", pw_shell="/bin/bash", pw_dir=home),
+    SimpleNamespace(pw_name="fixture", pw_shell="/__codex_test_shell__/login", pw_dir=home),
     SimpleNamespace(pw_name="service", pw_shell="/sbin/nologin", pw_dir="/var"),
 ]):
     sys.argv = [script, *args]
@@ -439,9 +511,14 @@ with patch("pwd.getpwall", return_value=[
         preview = run()
         self.assertEqual(preview.returncode, 0, preview.stderr)
         self.assertIn("cli-test", tomllib.loads(preview.stdout)["permissions"])
+        self.assertIn("unknown shell '/__codex_test_shell__/login' for 'fixture'", preview.stderr)
         self.assertIn("Login-capable user 'fixture'", preview.stderr)
         self.assertIn("Skipping 'service': non-login shell 'nologin'", preview.stderr)
         self.assertIn("Excluded top-level home directories:", preview.stderr)
+        strict = run("--unknown-shell", "error")
+        self.assertEqual(strict.returncode, 1, strict.stderr)
+        self.assertIn("unknown shell '/__codex_test_shell__/login' for 'fixture'", strict.stderr)
+        self.assertEqual(strict.stdout, "")
         checked = run("--validate")
         self.assertEqual(checked.returncode, 0, checked.stderr)
         self.assertIn("Validated 'cli-test'", checked.stdout)
