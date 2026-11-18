@@ -10,6 +10,8 @@ python3 scripts/generate_permission_profile.py --name isolated --output isolated
 
 The default command prints TOML to stdout. Diagnostics go to stderr and show discovered login-capable accounts and their home paths, skipped non-login accounts, the sorted list of excluded top-level directories, and any warnings. `--output` creates a new file exclusively. `--validate` checks the policy against the discovered homes, mount table, and known Linux `:minimal` paths without writing a file. Effective permissions also depend on Codex and its launch environment.
 
+The output starts with the top-level setting `default_permissions = "generated"` and defines a profile with that name. Use `--name isolated` to set both the selector and the profile name to `isolated`.
+
 ## Which homes are protected
 
 Python's `pwd.getpwall()` enumerates the system passwd database through the configured Name Service Switch (NSS) sources. The generator recognizes login shells by exact path in `/etc/shells`. It accepts absolute paths and ignores blank lines, comments, and surrounding whitespace. Shells whose final path component is `nologin`, `false`, `halt`, `shutdown`, or `sync` are treated as non-login shells even when listed. The current `HOME` is always protected, including when its account is missing from the results or has a skipped shell.
@@ -30,7 +32,7 @@ Some NSS backends can look up individual accounts while returning only a subset 
    codex -c 'default_permissions="isolated"' -C /path/to/workspace
    ```
 
-   For persistent selection, set `default_permissions = "isolated"` at the top level of your user config. Review existing legacy `sandbox_mode` and `sandbox_workspace_write` settings before selecting a named profile. Avoid passing `--sandbox` at launch because legacy sandbox settings can change which policy is selected. The CLI `--profile` flag selects a configuration layer. [Codex configuration reference](https://developers.openai.com/codex/config-reference)
+   For persistent selection, copy the generated `default_permissions` line above the first table header in your user config or replace the existing top-level setting. Review existing legacy `sandbox_mode` and `sandbox_workspace_write` settings before selecting a named profile. Avoid passing `--sandbox` at launch because legacy sandbox settings can change which policy is selected. The CLI `--profile` flag selects a configuration layer. [Codex configuration reference](https://developers.openai.com/codex/config-reference)
 
 To revert a one-off selection, exit the session and omit the command-line override. To revert a persistent selection, restore the previous `default_permissions` setting and remove the generated tables. You can also restore your backup if you made no other config edits. Restore the wrapper launcher if you previously used it, and restart Codex.
 

@@ -363,6 +363,7 @@ class ProfileTests(unittest.TestCase):
         self.make_directory(unusual)
         self.make_directory("glob[abc]")
         parsed = tomllib.loads(generate(self.host(), name).toml())
+        self.assertEqual(parsed["default_permissions"], name)
         profile = parsed["permissions"][name]
         self.assertEqual(set(profile), {"filesystem"})
         fs = profile["filesystem"]
@@ -502,15 +503,23 @@ with patch("pwd.getpwall", return_value=[
     runpy.run_path(script, run_name="__main__")
 """
         command = [sys.executable, "-B", "-c", entrypoint, str(SCRIPT), env["HOME"],
-                   "--temp", "none", "--name", "cli-test"]
+                   "--temp", "none"]
 
         def run(*args):
             return subprocess.run([*command, *args], env=env, capture_output=True,
                                   text=True, timeout=15)
 
+        default = run()
+        self.assertEqual(default.returncode, 0, default.stderr)
+        parsed = tomllib.loads(default.stdout)
+        self.assertEqual(parsed["default_permissions"], "generated")
+        self.assertIn("generated", parsed["permissions"])
+        command.extend(("--name", "cli-test"))
         preview = run()
         self.assertEqual(preview.returncode, 0, preview.stderr)
-        self.assertIn("cli-test", tomllib.loads(preview.stdout)["permissions"])
+        parsed = tomllib.loads(preview.stdout)
+        self.assertEqual(parsed["default_permissions"], "cli-test")
+        self.assertIn("cli-test", parsed["permissions"])
         self.assertIn("unknown shell '/__codex_test_shell__/login' for 'fixture'", preview.stderr)
         self.assertIn("Login-capable user 'fixture'", preview.stderr)
         self.assertIn("Skipping 'service': non-login shell 'nologin'", preview.stderr)
